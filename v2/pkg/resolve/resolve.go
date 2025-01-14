@@ -25,8 +25,9 @@ type ResolutionPool struct {
 
 // HostEntry defines a host with the source
 type HostEntry struct {
-	Host   string `json:"host"`
-	Source string `json:"source"`
+	Domain string
+	Host   string
+	Source string
 }
 
 // Result contains the result for a host resolution
