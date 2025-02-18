@@ -1,30 +1,42 @@
 package subscraping
 
 import (
-	"regexp"
-	"sync"
+	"math/rand"
+	"strings"
+
+	"github.com/projectdiscovery/gologger"
 )
 
-var subdomainExtractorMutex = &sync.Mutex{}
+const MultipleKeyPartsLength = 2
 
-// NewSubdomainExtractor creates a new regular expression to extract
-// subdomains from text based on the given domain.
-func NewSubdomainExtractor(domain string) (*regexp.Regexp, error) {
-	subdomainExtractorMutex.Lock()
-	defer subdomainExtractorMutex.Unlock()
-	extractor, err := regexp.Compile(`[a-zA-Z0-9\*_.-]+\.` + domain)
-	if err != nil {
-		return nil, err
+func PickRandom[T any](v []T, sourceName string) T {
+	var result T
+	length := len(v)
+	if length == 0 {
+		gologger.Debug().Msgf("Cannot use the %s source because there was no API key/secret defined for it.", sourceName)
+		return result
 	}
-	return extractor, nil
+	return v[rand.Intn(length)]
 }
 
-// Exists check if a key exist in a slice
-func Exists(values []string, key string) bool {
-	for _, v := range values {
-		if v == key {
-			return true
+func CreateApiKeys[T any](keys []string, provider func(k, v string) T) []T {
+	var result []T
+	for _, key := range keys {
+		if keyPartA, keyPartB, ok := createMultiPartKey(key); ok {
+			result = append(result, provider(keyPartA, keyPartB))
 		}
 	}
-	return false
+	return result
+}
+
+func createMultiPartKey(key string) (keyPartA, keyPartB string, ok bool) {
+	parts := strings.Split(key, ":")
+	ok = len(parts) == MultipleKeyPartsLength
+
+	if ok {
+		keyPartA = parts[0]
+		keyPartB = parts[1]
+	}
+
+	return
 }

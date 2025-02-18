@@ -4,12 +4,21 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"math"
 	"os"
 	"path"
+	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/projectdiscovery/gologger"
+	contextutil "github.com/projectdiscovery/utils/context"
+	fileutil "github.com/projectdiscovery/utils/file"
+	mapsutil "github.com/projectdiscovery/utils/maps"
+
 	"github.com/projectdiscovery/subfinder/v2/pkg/passive"
 	"github.com/projectdiscovery/subfinder/v2/pkg/resolve"
+	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
 // Runner is an instance of the subdomain enumeration
@@ -18,46 +27,64 @@ type Runner struct {
 	options        *Options
 	passiveAgent   *passive.Agent
 	resolverClient *resolve.Resolver
+	rateLimit      *subscraping.CustomRateLimit
 }
 
 // NewRunner creates a new runner struct instance by parsing
 // the configuration options, configuring sources, reading lists
 // and setting up loggers, etc.
 func NewRunner(options *Options) (*Runner, error) {
+	options.ConfigureOutput()
 	runner := &Runner{options: options}
+
+	// Check if the application loading with any provider configuration, then take it
+	// Otherwise load the default provider config
+	if fileutil.FileExists(options.ProviderConfig) {
+		gologger.Info().Msgf("Loading provider config from %s", options.ProviderConfig)
+		options.loadProvidersFrom(options.ProviderConfig)
+	} else {
+		gologger.Info().Msgf("Loading provider config from the default location: %s", defaultProviderConfigLocation)
+		options.loadProvidersFrom(defaultProviderConfigLocation)
+	}
 
 	// Initialize the passive subdomain enumeration engine
 	runner.initializePassiveEngine()
 
-	// Initialize the active subdomain enumeration engine
-	err := runner.initializeActiveEngine()
+	// Initialize the subdomain resolver
+	err := runner.initializeResolver()
 	if err != nil {
 		return nil, err
+	}
+
+	// Initialize the custom rate limit
+	runner.rateLimit = &subscraping.CustomRateLimit{
+		Custom: mapsutil.SyncLockMap[string, uint]{
+			Map: make(map[string]uint),
+		},
+	}
+
+	for source, sourceRateLimit := range options.RateLimits.AsMap() {
+		if sourceRateLimit.MaxCount > 0 && sourceRateLimit.MaxCount <= math.MaxUint {
+			_ = runner.rateLimit.Custom.Set(source, sourceRateLimit.MaxCount)
+		}
 	}
 
 	return runner, nil
 }
 
-// RunEnumeration runs the subdomain enumeration flow on the targets specified
-func (r *Runner) RunEnumeration(ctx context.Context) error {
+// RunEnumeration wraps RunEnumerationWithCtx with an empty context
+func (r *Runner) RunEnumeration() error {
+	ctx, _ := contextutil.WithValues(context.Background(), contextutil.ContextArg("All"), contextutil.ContextArg(strconv.FormatBool(r.options.All)))
+	return r.RunEnumerationWithCtx(ctx)
+}
+
+// RunEnumerationWithCtx runs the subdomain enumeration flow on the targets specified
+func (r *Runner) RunEnumerationWithCtx(ctx context.Context) error {
 	outputs := []io.Writer{r.options.Output}
 
-	// Check if only a single domain is sent as input. Process the domain now.
-	if r.options.Domain != "" {
-		// If output file specified, create file
-		if r.options.OutputFile != "" {
-			outputter := NewOutputter(r.options.JSON)
-			file, err := outputter.createFile(r.options.OutputFile, false)
-			if err != nil {
-				gologger.Error().Msgf("Could not create file %s for %s: %s\n", r.options.OutputFile, r.options.Domain, err)
-				return err
-			}
-			defer file.Close()
-
-			outputs = append(outputs, file)
-		}
-
-		return r.EnumerateSingleDomain(ctx, r.options.Domain, outputs)
+	if len(r.options.Domain) > 0 {
+		domainsReader := strings.NewReader(strings.Join(r.options.Domain, "\n"))
+		return r.EnumerateMultipleDomainsWithCtx(ctx, domainsReader, outputs)
 	}
 
 	// If we have multiple domains as input,
@@ -66,42 +93,51 @@ func (r *Runner) RunEnumeration(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		err = r.EnumerateMultipleDomains(ctx, f, outputs)
+		err = r.EnumerateMultipleDomainsWithCtx(ctx, f, outputs)
 		f.Close()
 		return err
 	}
 
 	// If we have STDIN input, treat it as multiple domains
 	if r.options.Stdin {
-		return r.EnumerateMultipleDomains(ctx, os.Stdin, outputs)
+		return r.EnumerateMultipleDomainsWithCtx(ctx, os.Stdin, outputs)
 	}
 	return nil
 }
 
-// EnumerateMultipleDomains enumerates subdomains for multiple domains
+// EnumerateMultipleDomains wraps EnumerateMultipleDomainsWithCtx with an empty context
+func (r *Runner) EnumerateMultipleDomains(reader io.Reader, writers []io.Writer) error {
+	ctx, _ := contextutil.WithValues(context.Background(), contextutil.ContextArg("All"), contextutil.ContextArg(strconv.FormatBool(r.options.All)))
+	return r.EnumerateMultipleDomainsWithCtx(ctx, reader, writers)
+}
+
+// EnumerateMultipleDomainsWithCtx enumerates subdomains for multiple domains
 // We keep enumerating subdomains for a given domain until we reach an error
-func (r *Runner) EnumerateMultipleDomains(ctx context.Context, reader io.Reader, outputs []io.Writer) error {
+func (r *Runner) EnumerateMultipleDomainsWithCtx(ctx context.Context, reader io.Reader, writers []io.Writer) error {
+	var err error
 	scanner := bufio.NewScanner(reader)
+	ip, _ := regexp.Compile(`^([0-9\.]+$)`)
 	for scanner.Scan() {
-		domain := scanner.Text()
-		if domain == "" {
+		domain := preprocessDomain(scanner.Text())
+		domain = replacer.Replace(domain)
+
+		if domain == "" || (r.options.ExcludeIps && ip.MatchString(domain)) {
 			continue
 		}
 
-		var err error
 		var file *os.File
 		// If the user has specified an output file, use that output file instead
 		// of creating a new output file for each domain. Else create a new file
 		// for each domain in the directory.
 		if r.options.OutputFile != "" {
-			outputter := NewOutputter(r.options.JSON)
-			file, err = outputter.createFile(r.options.OutputFile, true)
+			outputWriter := NewOutputWriter(r.options.JSON)
+			file, err = outputWriter.createFile(r.options.OutputFile, true)
 			if err != nil {
 				gologger.Error().Msgf("Could not create file %s for %s: %s\n", r.options.OutputFile, r.options.Domain, err)
 				return err
 			}
 
-			err = r.EnumerateSingleDomain(ctx, domain, append(outputs, file))
+			_, err = r.EnumerateSingleDomainWithCtx(ctx, domain, append(writers, file))
 
 			file.Close()
 		} else if r.options.OutputDirectory != "" {
@@ -112,18 +148,18 @@ func (r *Runner) EnumerateMultipleDomains(ctx context.Context, reader io.Reader,
 				outputFile += ".txt"
 			}
 
-			outputter := NewOutputter(r.options.JSON)
-			file, err = outputter.createFile(outputFile, false)
+			outputWriter := NewOutputWriter(r.options.JSON)
+			file, err = outputWriter.createFile(outputFile, false)
 			if err != nil {
 				gologger.Error().Msgf("Could not create file %s for %s: %s\n", r.options.OutputFile, r.options.Domain, err)
 				return err
 			}
 
-			err = r.EnumerateSingleDomain(ctx, domain, append(outputs, file))
+			_, err = r.EnumerateSingleDomainWithCtx(ctx, domain, append(writers, file))
 
 			file.Close()
 		} else {
-			err = r.EnumerateSingleDomain(ctx, domain, outputs)
+			_, err = r.EnumerateSingleDomainWithCtx(ctx, domain, writers)
 		}
 		if err != nil {
 			return err

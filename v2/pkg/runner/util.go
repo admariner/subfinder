@@ -1,24 +1,32 @@
 package runner
 
 import (
-	"bufio"
-	"os"
+	fileutil "github.com/projectdiscovery/utils/file"
+	stringsutil "github.com/projectdiscovery/utils/strings"
 )
 
 func loadFromFile(file string) ([]string, error) {
-	var items []string
-	f, err := os.Open(file)
+	chanItems, err := fileutil.ReadFile(file)
 	if err != nil {
-		return items, err
+		return nil, err
 	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		text := scanner.Text()
-		if text == "" {
+	var items []string
+	for item := range chanItems {
+		item = preprocessDomain(item)
+		if item == "" {
 			continue
 		}
-		items = append(items, text)
+		items = append(items, item)
 	}
-	return items, scanner.Err()
+	return items, nil
+}
+
+func preprocessDomain(s string) string {
+	return stringsutil.NormalizeWithOptions(s,
+		stringsutil.NormalizeOptions{
+			StripComments: true,
+			TrimCutset:    "\n\t\"'` ",
+			Lowercase:     true,
+		},
+	)
 }
